@@ -172,7 +172,7 @@ func (e *sharedIntegrationEnv) reset(ctx context.Context) error {
 	if err := e.redisAdmin.FlushDB(ctx).Err(); err != nil {
 		return fmt.Errorf("flush redis: %w", err)
 	}
-	if _, err := e.pool.Exec(ctx, "TRUNCATE jobs, image_cache_entries, stream_encryption_keys"); err != nil {
+	if _, err := e.pool.Exec(ctx, "TRUNCATE jobs, image_cache_entries, stream_encryption_keys, encryption_keys"); err != nil {
 		return fmt.Errorf("truncate tables: %w", err)
 	}
 	for _, bucket := range []string{e.baseConfig.SourceBucket, e.baseConfig.MediaBucket} {

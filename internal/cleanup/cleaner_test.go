@@ -103,7 +103,7 @@ func (q *fakeQueries) ListJobsByHash(context.Context, string) ([]dbq.Job, error)
 	return q.jobs, nil
 }
 
-func (q *fakeQueries) DeleteStreamEncryptionKeysBySourceHash(_ context.Context, hash string) error {
+func (q *fakeQueries) DeleteEncryptionKeysBySourceHash(_ context.Context, hash string) error {
 	if q.deleteKeyErr != nil {
 		return q.deleteKeyErr
 	}

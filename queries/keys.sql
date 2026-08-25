@@ -12,8 +12,15 @@ RETURNING *;
 -- name: GetStreamEncryptionKey :one
 SELECT * FROM stream_encryption_keys WHERE id = $1;
 
--- name: DeleteStreamEncryptionKeysBySourceHash :exec
-DELETE FROM stream_encryption_keys WHERE source_hash = $1;
+-- name: GetLegacyEncryptionKey :one
+SELECT * FROM encryption_keys WHERE hash = $1;
+
+-- name: DeleteEncryptionKeysBySourceHash :exec
+WITH deleted_stream_keys AS (
+    DELETE FROM stream_encryption_keys WHERE source_hash = $1
+    RETURNING source_hash
+)
+DELETE FROM encryption_keys WHERE hash = $1;
 
 -- name: UpsertImageCacheEntry :exec
 INSERT INTO image_cache_entries (hash, cache_key, storage_key)

@@ -24,8 +24,10 @@ import (
 // Endpoint: GET /api/key/:id
 //   - Authorization: Bearer {token}
 //
-// The handler verifies the token (HMAC-SHA256 signature, expiration, and hash match),
-// then returns the 16-byte AES key with Cache-Control: no-store.
+// UUID paths resolve the current asset-scoped stream table. Non-UUID paths are
+// a read-only compatibility boundary for playlists produced before v2.1. The
+// handler verifies the token (HMAC-SHA256 signature, expiration, and source
+// hash match), then returns the 16-byte AES key with Cache-Control: no-store.
 type KeyHandler struct {
 	queries        *dbq.Queries
 	keyTokenSecret string
@@ -69,23 +71,47 @@ func (h *KeyHandler) Handle(c *echo.Context) error {
 		return c.String(http.StatusForbidden, "Forbidden")
 	}
 
-	// Fetch from DB.
+	// UUID paths are never allowed to fall back to the legacy hash table. This
+	// keeps the two identities unambiguous while old hash playlists remain
+	// readable until they are explicitly reprocessed.
 	ctx := c.Request().Context()
-	keyID, err := uuid.Parse(id)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid key id")
+	var sourceHash string
+	var wrappedKey, wrapNonce []byte
+	var kekVersion string
+	if keyID, parseErr := uuid.Parse(id); parseErr == nil {
+		row, queryErr := h.queries.GetStreamEncryptionKey(ctx, keyID)
+		if queryErr != nil {
+			return c.String(http.StatusNotFound, "Not Found")
+		}
+		sourceHash = row.SourceHash
+		wrappedKey = row.WrappedKey
+		wrapNonce = row.WrapNonce
+		kekVersion = row.KekVersion
+	} else {
+		// The legacy path itself is the source hash, so preserve the v2.0
+		// boundary and reject a mismatched token before revealing row
+		// existence. The post-query comparison below still treats the stored
+		// hash as authoritative.
+		if payload.Hash != id {
+			return c.String(http.StatusForbidden, "Forbidden")
+		}
+		row, queryErr := h.queries.GetLegacyEncryptionKey(ctx, id)
+		if queryErr != nil {
+			return c.String(http.StatusNotFound, "Not Found")
+		}
+		sourceHash = row.Hash
+		wrappedKey = row.WrappedKey
+		wrapNonce = row.WrapNonce
+		kekVersion = row.KekVersion
 	}
-	row, err := h.queries.GetStreamEncryptionKey(ctx, keyID)
-	if err != nil {
-		return c.String(http.StatusNotFound, "Not Found")
-	}
-	if payload.Hash != row.SourceHash {
+
+	if payload.Hash != sourceHash {
 		return c.String(http.StatusForbidden, "Forbidden")
 	}
 
-	aesKey, err := h.wrapper.Unwrap(row.WrappedKey, row.WrapNonce, row.KekVersion)
+	aesKey, err := h.wrapper.Unwrap(wrappedKey, wrapNonce, kekVersion)
 	if err != nil {
-		slog.Error("unwrap encryption key failed", apptracing.LogFields(ctx, "key_id", id, "hash", row.SourceHash, "error", err)...)
+		slog.Error("unwrap encryption key failed", apptracing.LogFields(ctx, "key_id", id, "hash", sourceHash, "error", err)...)
 		return c.String(http.StatusInternalServerError, "Internal Server Error")
 	}
 

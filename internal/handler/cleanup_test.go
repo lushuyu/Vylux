@@ -38,7 +38,7 @@ type cleanupHandlerQueries struct{}
 func (cleanupHandlerQueries) ListJobsByHash(context.Context, string) ([]dbq.Job, error) {
 	return nil, nil
 }
-func (cleanupHandlerQueries) DeleteStreamEncryptionKeysBySourceHash(context.Context, string) error {
+func (cleanupHandlerQueries) DeleteEncryptionKeysBySourceHash(context.Context, string) error {
 	return nil
 }
 func (cleanupHandlerQueries) DeleteJobsByHash(context.Context, string) error { return nil }

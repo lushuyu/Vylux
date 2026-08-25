@@ -12,8 +12,119 @@ import (
 	"time"
 
 	"Vylux/internal/db/dbq"
+	"Vylux/internal/encryption"
 	"Vylux/internal/signature"
 )
+
+func TestCleanup_DeleteMedia_RemovesCurrentAndLegacyKeys(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ts, cfg, _, queries, _, cleanup := newS3BackedTestServerWithDeps(t)
+	defer cleanup()
+
+	hash := strings.Repeat("e", 64)
+	seedEncryptionKey(t, cfg.EncryptionKey, queries, hash, encryption.AssetTypeVideo)
+	seedLegacyEncryptionKey(t, cfg.EncryptionKey, hash)
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/media/"+hash, nil)
+	req.Header.Set("X-API-Key", cfg.APIKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE /api/media/:hash: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 204: %s", resp.StatusCode, body)
+	}
+
+	var streamCount, legacyCount int
+	if err := integrationEnv.pool.QueryRow(
+		context.Background(),
+		"SELECT count(*) FROM stream_encryption_keys WHERE source_hash = $1",
+		hash,
+	).Scan(&streamCount); err != nil {
+		t.Fatalf("count current stream keys: %v", err)
+	}
+	if err := integrationEnv.pool.QueryRow(
+		context.Background(),
+		"SELECT count(*) FROM encryption_keys WHERE hash = $1",
+		hash,
+	).Scan(&legacyCount); err != nil {
+		t.Fatalf("count legacy keys: %v", err)
+	}
+	if streamCount != 0 || legacyCount != 0 {
+		t.Fatalf("remaining key rows: stream=%d legacy=%d", streamCount, legacyCount)
+	}
+}
+
+func TestCleanupKeyQuery_RollsBackStreamDeleteWhenLegacyDeleteFails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ts, cfg, _, queries, _, cleanup := newS3BackedTestServerWithDeps(t)
+	defer cleanup()
+	ts.Close()
+
+	hash := strings.Repeat("f", 64)
+	seedEncryptionKey(t, cfg.EncryptionKey, queries, hash, encryption.AssetTypeVideo)
+	seedLegacyEncryptionKey(t, cfg.EncryptionKey, hash)
+
+	ctx := context.Background()
+	if _, err := integrationEnv.pool.Exec(ctx, `
+		CREATE FUNCTION vylux_test_reject_legacy_key_delete()
+		RETURNS trigger AS $$
+		BEGIN
+			RAISE EXCEPTION 'injected legacy key delete failure';
+		END;
+		$$ LANGUAGE plpgsql`); err != nil {
+		t.Fatalf("create legacy delete failure function: %v", err)
+	}
+	defer func() {
+		if _, err := integrationEnv.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS vylux_test_reject_legacy_key_delete ON encryption_keys`); err != nil {
+			t.Errorf("drop legacy delete failure trigger: %v", err)
+		}
+		if _, err := integrationEnv.pool.Exec(context.Background(), `
+			DROP FUNCTION IF EXISTS vylux_test_reject_legacy_key_delete()`); err != nil {
+			t.Errorf("drop legacy delete failure function: %v", err)
+		}
+	}()
+	if _, err := integrationEnv.pool.Exec(ctx, `
+		CREATE TRIGGER vylux_test_reject_legacy_key_delete
+		BEFORE DELETE ON encryption_keys
+		FOR EACH ROW EXECUTE FUNCTION vylux_test_reject_legacy_key_delete()`); err != nil {
+		t.Fatalf("create legacy delete failure trigger: %v", err)
+	}
+
+	if err := queries.DeleteEncryptionKeysBySourceHash(ctx, hash); err == nil {
+		t.Fatal("combined key delete unexpectedly succeeded through injected legacy failure")
+	} else if !strings.Contains(err.Error(), "injected legacy key delete failure") {
+		t.Fatalf("combined key delete error = %v, want injected legacy failure", err)
+	}
+
+	var streamCount, legacyCount int
+	if err := integrationEnv.pool.QueryRow(
+		ctx,
+		"SELECT count(*) FROM stream_encryption_keys WHERE source_hash = $1",
+		hash,
+	).Scan(&streamCount); err != nil {
+		t.Fatalf("count current stream keys after failed delete: %v", err)
+	}
+	if err := integrationEnv.pool.QueryRow(
+		ctx,
+		"SELECT count(*) FROM encryption_keys WHERE hash = $1",
+		hash,
+	).Scan(&legacyCount); err != nil {
+		t.Fatalf("count legacy keys after failed delete: %v", err)
+	}
+	if streamCount != 1 || legacyCount != 1 {
+		t.Fatalf("key delete was not atomic: stream=%d legacy=%d, want 1 and 1", streamCount, legacyCount)
+	}
+}
 
 // TestCleanup_DeleteMedia verifies the DELETE /api/media/:hash endpoint.
 func TestCleanup_DeleteMedia(t *testing.T) {

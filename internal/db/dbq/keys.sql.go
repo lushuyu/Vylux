@@ -11,6 +11,19 @@ import (
 	"uuid"
 )
 
+const deleteEncryptionKeysBySourceHash = `-- name: DeleteEncryptionKeysBySourceHash :exec
+WITH deleted_stream_keys AS (
+    DELETE FROM stream_encryption_keys WHERE source_hash = $1
+    RETURNING source_hash
+)
+DELETE FROM encryption_keys WHERE hash = $1
+`
+
+func (q *Queries) DeleteEncryptionKeysBySourceHash(ctx context.Context, hash string) error {
+	_, err := q.db.Exec(ctx, deleteEncryptionKeysBySourceHash, hash)
+	return err
+}
+
 const deleteImageCacheEntriesByHash = `-- name: DeleteImageCacheEntriesByHash :exec
 DELETE FROM image_cache_entries WHERE hash = $1
 `
@@ -20,13 +33,24 @@ func (q *Queries) DeleteImageCacheEntriesByHash(ctx context.Context, hash string
 	return err
 }
 
-const deleteStreamEncryptionKeysBySourceHash = `-- name: DeleteStreamEncryptionKeysBySourceHash :exec
-DELETE FROM stream_encryption_keys WHERE source_hash = $1
+const getLegacyEncryptionKey = `-- name: GetLegacyEncryptionKey :one
+SELECT hash, wrapped_key, wrap_nonce, kek_version, kid, scheme, key_uri, created_at FROM encryption_keys WHERE hash = $1
 `
 
-func (q *Queries) DeleteStreamEncryptionKeysBySourceHash(ctx context.Context, sourceHash string) error {
-	_, err := q.db.Exec(ctx, deleteStreamEncryptionKeysBySourceHash, sourceHash)
-	return err
+func (q *Queries) GetLegacyEncryptionKey(ctx context.Context, hash string) (EncryptionKey, error) {
+	row := q.db.QueryRow(ctx, getLegacyEncryptionKey, hash)
+	var i EncryptionKey
+	err := row.Scan(
+		&i.Hash,
+		&i.WrappedKey,
+		&i.WrapNonce,
+		&i.KekVersion,
+		&i.Kid,
+		&i.Scheme,
+		&i.KeyUri,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const getStreamEncryptionKey = `-- name: GetStreamEncryptionKey :one
