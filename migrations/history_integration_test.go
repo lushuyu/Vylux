@@ -14,6 +14,7 @@ import (
 	"testing"
 	"testing/fstest"
 	"time"
+	"uuid"
 
 	"Vylux/internal/db"
 	"Vylux/migrations"
@@ -21,7 +22,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
-	"uuid"
 )
 
 //go:embed testdata/001_rewritten_v2_1.sql
@@ -44,6 +44,10 @@ func TestStreamKeyBridgeConvergesReleasedMigrationHistories(t *testing.T) {
 		t.Fatalf("connect migration test database: %v", err)
 	}
 	t.Cleanup(admin.Close)
+	var serverVersionNum int
+	if err := admin.QueryRow(ctx, "SELECT current_setting('server_version_num')::INTEGER").Scan(&serverVersionNum); err != nil {
+		t.Fatalf("read PostgreSQL server version: %v", err)
+	}
 
 	oldInitial := migrationSubset(t, "001_initial.sql")
 	releasedV20Initial, err := fs.ReadFile(migrations.FS, "001_initial.sql")
@@ -177,6 +181,8 @@ func TestStreamKeyBridgeConvergesReleasedMigrationHistories(t *testing.T) {
 		wantError       string
 		wantLegacyTable bool
 		wantStreamTable bool
+		minimumVersion  int
+		wantLegacyNull  bool
 	}{
 		{
 			name:            "wrong_primary_key",
@@ -211,6 +217,14 @@ func TestStreamKeyBridgeConvergesReleasedMigrationHistories(t *testing.T) {
 			wantStreamTable: true,
 		},
 		{
+			name:            "missing_stream_source_hash_not_null",
+			initial:         releasedV21Initial,
+			old:             "    source_hash    TEXT        NOT NULL,",
+			replacement:     "    source_hash    TEXT,",
+			wantError:       "found an incompatible stream_encryption_keys relation",
+			wantStreamTable: true,
+		},
+		{
 			name:            "extra_stream_rejector_constraint",
 			initial:         releasedV21Initial,
 			old:             "    CONSTRAINT uq_stream_encryption_keys_asset UNIQUE (source_hash, asset_type, packaging_type)",
@@ -236,6 +250,14 @@ func TestStreamKeyBridgeConvergesReleasedMigrationHistories(t *testing.T) {
 			wantLegacyTable: true,
 		},
 		{
+			name:            "missing_legacy_wrapped_key_not_null",
+			initial:         releasedV20Initial,
+			old:             "    wrapped_key BYTEA       NOT NULL,",
+			replacement:     "    wrapped_key BYTEA,",
+			wantError:       "found an incompatible encryption_keys relation",
+			wantLegacyTable: true,
+		},
+		{
 			name:            "extra_legacy_rejector_constraint",
 			initial:         releasedV20Initial,
 			old:             "    key_uri     TEXT        NOT NULL DEFAULT '',\n    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()",
@@ -252,9 +274,36 @@ func TestStreamKeyBridgeConvergesReleasedMigrationHistories(t *testing.T) {
 			wantError:       "found an unsupported standalone unique key-table index",
 			wantLegacyTable: true,
 		},
+		{
+			name:    "unvalidated_legacy_not_null_constraint",
+			initial: releasedV20Initial,
+			old:     "    key_uri     TEXT        NOT NULL DEFAULT '',\n    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()\n);",
+			replacement: "    key_uri     TEXT        NOT NULL DEFAULT '',\n    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()\n);\n\n" +
+				"ALTER TABLE encryption_keys ALTER COLUMN wrapped_key DROP NOT NULL;\n" +
+				"INSERT INTO encryption_keys (hash, wrapped_key, wrap_nonce) VALUES (repeat('a', 64), NULL, '\\x01'::bytea);\n" +
+				"ALTER TABLE encryption_keys ADD CONSTRAINT vylux_test_legacy_wrapped_key_not_null NOT NULL wrapped_key NOT VALID;",
+			wantError:       "found an incompatible not-null key-table constraint",
+			wantLegacyTable: true,
+			minimumVersion:  180000,
+			wantLegacyNull:  true,
+		},
+		{
+			name:    "no_inherit_stream_not_null_constraint",
+			initial: releasedV21Initial,
+			old:     "    CONSTRAINT uq_stream_encryption_keys_asset UNIQUE (source_hash, asset_type, packaging_type)\n);",
+			replacement: "    CONSTRAINT uq_stream_encryption_keys_asset UNIQUE (source_hash, asset_type, packaging_type)\n);\n\n" +
+				"ALTER TABLE stream_encryption_keys ALTER COLUMN wrapped_key DROP NOT NULL;\n" +
+				"ALTER TABLE stream_encryption_keys ADD CONSTRAINT vylux_test_stream_wrapped_key_not_null NOT NULL wrapped_key NO INHERIT;",
+			wantError:       "found an incompatible not-null key-table constraint",
+			wantStreamTable: true,
+			minimumVersion:  180000,
+		},
 	}
 	for _, malformedCase := range malformedCases {
 		t.Run(malformedCase.name, func(t *testing.T) {
+			if serverVersionNum < malformedCase.minimumVersion {
+				t.Skipf("requires PostgreSQL server_version_num >= %d", malformedCase.minimumVersion)
+			}
 			schemaDSN := newMigrationTestSchema(t, ctx, admin, databaseDSN)
 			malformed := replaceExactlyOnce(
 				t,
@@ -283,6 +332,15 @@ func TestStreamKeyBridgeConvergesReleasedMigrationHistories(t *testing.T) {
 			}
 			assertAppliedVersions(t, ctx, pool, []int64{1, 2, 3})
 			assertKeyTables(t, ctx, pool, malformedCase.wantLegacyTable, malformedCase.wantStreamTable)
+			if malformedCase.wantLegacyNull {
+				var nullRows int
+				if err := pool.QueryRow(ctx, "SELECT count(*) FROM encryption_keys WHERE wrapped_key IS NULL").Scan(&nullRows); err != nil {
+					t.Fatalf("count retained legacy NULL key rows: %v", err)
+				}
+				if nullRows != 1 {
+					t.Fatalf("retained legacy NULL key rows = %d, want 1", nullRows)
+				}
+			}
 		})
 	}
 }

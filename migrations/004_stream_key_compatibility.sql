@@ -120,13 +120,74 @@ BEGIN
         RAISE EXCEPTION 'migration 004 found an incompatible stream_encryption_keys relation';
     END IF;
 
+    -- PostgreSQL 18 represents relation-level NOT NULL specifications as
+    -- pg_constraint rows. Validate their semantics before excluding that
+    -- version-specific representation from the table-constraint comparison.
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint AS not_null_constraint
+        LEFT JOIN pg_attribute AS constrained_attribute
+          ON constrained_attribute.attrelid = not_null_constraint.conrelid
+         AND constrained_attribute.attnum = not_null_constraint.conkey[1]
+         AND constrained_attribute.attnum > 0
+         AND NOT constrained_attribute.attisdropped
+        WHERE not_null_constraint.conrelid IN (
+            to_regclass('encryption_keys'),
+            to_regclass('stream_encryption_keys')
+        )
+          AND not_null_constraint.contype = 'n'
+          AND (
+              cardinality(not_null_constraint.conkey) IS DISTINCT FROM 1
+              OR constrained_attribute.attnum IS NULL
+              OR NOT constrained_attribute.attnotnull
+              OR NOT not_null_constraint.convalidated
+              OR not_null_constraint.condeferrable
+              OR not_null_constraint.condeferred
+              OR NOT not_null_constraint.conislocal
+              OR not_null_constraint.coninhcount <> 0
+              OR not_null_constraint.connoinherit
+              OR not_null_constraint.conparentid <> 0
+          )
+    ) THEN
+        RAISE EXCEPTION 'migration 004 found an incompatible not-null key-table constraint';
+    END IF;
+
+    -- PostgreSQL 18 must expose exactly one validated local NOT NULL row for
+    -- every non-null key-table column. PostgreSQL 16 has no such rows and is
+    -- still protected by the exact column contracts above.
+    IF current_setting('server_version_num')::INTEGER >= 180000
+       AND EXISTS (
+           SELECT 1
+           FROM pg_attribute AS non_null_attribute
+           WHERE non_null_attribute.attrelid IN (
+               to_regclass('encryption_keys'),
+               to_regclass('stream_encryption_keys')
+           )
+             AND non_null_attribute.attnum > 0
+             AND NOT non_null_attribute.attisdropped
+             AND non_null_attribute.attnotnull
+             AND (
+                 SELECT count(*)
+                 FROM pg_constraint AS not_null_constraint
+                 WHERE not_null_constraint.conrelid = non_null_attribute.attrelid
+                   AND not_null_constraint.contype = 'n'
+                   AND not_null_constraint.conkey = ARRAY[non_null_attribute.attnum]::SMALLINT[]
+             ) <> 1
+       ) THEN
+        RAISE EXCEPTION 'migration 004 found incomplete PostgreSQL 18 not-null constraint evidence';
+    END IF;
+
     SELECT array_agg(
         conname || ':' || contype::TEXT || ':' || pg_get_constraintdef(oid, FALSE)
         ORDER BY conname
     )
     INTO legacy_constraints
     FROM pg_constraint
-    WHERE conrelid = to_regclass('encryption_keys');
+    WHERE conrelid = to_regclass('encryption_keys')
+      -- PostgreSQL 18 also stores column NOT NULL specifications in
+      -- pg_constraint. Column nullability was validated above, so exclude
+      -- those version-specific catalog rows from the table-constraint set.
+      AND contype <> 'n';
 
     IF legacy_constraints IS DISTINCT FROM ARRAY[
         'encryption_keys_pkey:p:PRIMARY KEY (hash)'
@@ -140,7 +201,8 @@ BEGIN
     )
     INTO stream_constraints
     FROM pg_constraint
-    WHERE conrelid = to_regclass('stream_encryption_keys');
+    WHERE conrelid = to_regclass('stream_encryption_keys')
+      AND contype <> 'n';
 
     IF stream_constraints IS DISTINCT FROM ARRAY[
         'chk_stream_encryption_keys_asset_type:c:CHECK ((asset_type = ANY (ARRAY[''audio''::text, ''video''::text])))',

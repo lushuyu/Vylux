@@ -16,7 +16,7 @@ func TestMigrationDigests(t *testing.T) {
 		{name: "001_initial.sql", want: "0a62946e71b0db96c51f6e6a04fd2ebb84937324037116d754d3761a495f715f"},
 		{name: "002_media_lifecycle.sql", want: "9f6e33126dc67e5309b2ccc7b41a1c29726172ed735634bad3cec1fcf9a3bdb7"},
 		{name: "003_deployment_target.sql", want: "4c696946e2dfcdd9aabf2174ef37be47da0c5762fc8367d150a1e893930edd31"},
-		{name: "004_stream_key_compatibility.sql", want: "eaa598e20456e538c90e3cce2099529a76cb0c632caec866b1af630ea91ac94e"},
+		{name: "004_stream_key_compatibility.sql", want: "f4d3066e83fe46223994cd0a853f5a4728a506f55f6daa95e8b44fe28e7be7e3"},
 	}
 
 	for _, tt := range tests {
