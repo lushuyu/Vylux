@@ -2,8 +2,8 @@ package db
 
 import (
 	"context"
-	"embed"
 	"fmt"
+	"io/fs"
 	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -37,7 +37,7 @@ func Connect(ctx context.Context, databaseURL string) (*Pool, error) {
 // It uses database/sql via pgx/stdlib under the hood because goose
 // does not natively support pgxpool.
 // The caller must provide the embedded migrations FS (from the module root).
-func Migrate(ctx context.Context, databaseURL string, migrationsFS embed.FS) error {
+func Migrate(ctx context.Context, databaseURL string, migrationsFS fs.FS) error {
 	goose.SetBaseFS(migrationsFS)
 
 	sqlDB, err := goose.OpenDBWithDriver("pgx", databaseURL)

@@ -12,6 +12,17 @@ import (
 	"uuid"
 )
 
+type EncryptionKey struct {
+	Hash       string    `json:"hash"`
+	WrappedKey []byte    `json:"wrapped_key"`
+	WrapNonce  []byte    `json:"wrap_nonce"`
+	KekVersion string    `json:"kek_version"`
+	Kid        string    `json:"kid"`
+	Scheme     string    `json:"scheme"`
+	KeyUri     string    `json:"key_uri"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 type ImageCacheEntry struct {
 	Hash       string    `json:"hash"`
 	CacheKey   string    `json:"cache_key"`
@@ -35,6 +46,25 @@ type Job struct {
 	Results            json.RawMessage `json:"results"`
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
+}
+
+type MediaLifecycleReadiness struct {
+	Singleton             bool        `json:"singleton"`
+	CacheAuditCursor      string      `json:"cache_audit_cursor"`
+	CacheAuditComplete    bool        `json:"cache_audit_complete"`
+	CacheAuditArmed       bool        `json:"cache_audit_armed"`
+	CacheAuditError       string      `json:"cache_audit_error"`
+	UpdatedAt             time.Time   `json:"updated_at"`
+	ProtocolVersion       pgtype.Int2 `json:"protocol_version"`
+	DeploymentID          pgtype.Text `json:"deployment_id"`
+	SourceBackendIdentity pgtype.Text `json:"source_backend_identity"`
+	MediaBackendIdentity  pgtype.Text `json:"media_backend_identity"`
+}
+
+type MediaTombstone struct {
+	Hash      string    `json:"hash"`
+	Source    string    `json:"source"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type StreamEncryptionKey struct {
