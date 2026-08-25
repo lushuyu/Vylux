@@ -13,6 +13,7 @@ import (
 	"Vylux/internal/db/dbq"
 	"Vylux/internal/jobflow"
 	"Vylux/internal/queue"
+	apptracing "Vylux/internal/tracing"
 	"Vylux/tests/testutil"
 
 	"github.com/labstack/echo/v5"
@@ -212,6 +213,20 @@ func TestDecodeImageJobRequest(t *testing.T) {
 	if req.Hash != "hash123" || req.Source != "uploads/image.png" {
 		t.Fatalf("unexpected request: %+v", req)
 	}
+	if err := canonicalizeJobRequest(&req); err != nil {
+		t.Fatalf("canonicalizeJobRequest: %v", err)
+	}
+	payload, err := buildImageThumbnailPayload(req, apptracing.TraceCarrier{})
+	if err != nil {
+		t.Fatalf("buildImageThumbnailPayload: %v", err)
+	}
+	if len(payload.Outputs) != 1 {
+		t.Fatalf("outputs length = %d, want 1", len(payload.Outputs))
+	}
+	want := queue.ThumbnailOutput{Variant: "thumbnail", Width: 320, Format: "webp"}
+	if payload.Outputs[0] != want {
+		t.Fatalf("output = %#v, want %#v", payload.Outputs[0], want)
+	}
 }
 
 func TestDecodeVideoJobRequest(t *testing.T) {
@@ -275,6 +290,95 @@ func TestRequestFingerprint_StructuredMatchesCanonicalAudio(t *testing.T) {
 	}
 	if structuredFingerprint != canonicalFingerprint {
 		t.Fatalf("fingerprints differ: structured=%q canonical=%q", structuredFingerprint, canonicalFingerprint)
+	}
+}
+
+func TestRequestFingerprint_StructuredMatchesLegacyImage(t *testing.T) {
+	structuredBody := `{
+		"source":{"hash":"hash123","key":"uploads/image.png"},
+		"pipeline":{"outputs":[{"variant":"thumbnail","width":320,"height":180,"format":"webp"}]}
+	}`
+
+	structuredReq, err := decodeImageJobRequestContext(t, structuredBody)
+	if err != nil {
+		t.Fatalf("decode structured request: %v", err)
+	}
+	if err := canonicalizeJobRequest(&structuredReq); err != nil {
+		t.Fatalf("canonicalize structured request: %v", err)
+	}
+
+	legacyReq := JobRequest{
+		Type:   queue.TypeImageThumbnail,
+		Hash:   "hash123",
+		Source: "uploads/image.png",
+		Options: map[string]any{
+			"outputs": []any{map[string]any{
+				"variant": "thumbnail",
+				"width":   float64(320),
+				"height":  float64(180),
+				"format":  "webp",
+			}},
+		},
+	}
+	if err := canonicalizeJobRequest(&legacyReq); err != nil {
+		t.Fatalf("canonicalize legacy request: %v", err)
+	}
+
+	structuredFingerprint, err := requestFingerprint(structuredReq)
+	if err != nil {
+		t.Fatalf("requestFingerprint(structured): %v", err)
+	}
+	legacyFingerprint, err := requestFingerprint(legacyReq)
+	if err != nil {
+		t.Fatalf("requestFingerprint(legacy): %v", err)
+	}
+	if structuredFingerprint != legacyFingerprint {
+		t.Fatalf("fingerprints differ: structured=%q legacy=%q", structuredFingerprint, legacyFingerprint)
+	}
+}
+
+func TestRequestFingerprint_EquivalentImageFormatsMatch(t *testing.T) {
+	makeRequest := func(format string) JobRequest {
+		return JobRequest{
+			Type:   queue.TypeImageThumbnail,
+			Hash:   "hash123",
+			Source: "uploads/image.png",
+			Options: map[string]any{
+				"outputs": []map[string]any{{
+					"variant": "thumbnail",
+					"width":   320,
+					"format":  format,
+				}},
+			},
+		}
+	}
+
+	jpegRequest := makeRequest("jpeg")
+	dottedUpperRequest := makeRequest(".JPG")
+	for _, req := range []*JobRequest{&jpegRequest, &dottedUpperRequest} {
+		if err := canonicalizeJobRequest(req); err != nil {
+			t.Fatalf("canonicalizeJobRequest: %v", err)
+		}
+	}
+
+	jpegFingerprint, err := requestFingerprint(jpegRequest)
+	if err != nil {
+		t.Fatalf("requestFingerprint(jpeg): %v", err)
+	}
+	dottedUpperFingerprint, err := requestFingerprint(dottedUpperRequest)
+	if err != nil {
+		t.Fatalf("requestFingerprint(.JPG): %v", err)
+	}
+	if jpegFingerprint != dottedUpperFingerprint {
+		t.Fatalf("equivalent image formats produced different fingerprints: jpeg=%q .JPG=%q", jpegFingerprint, dottedUpperFingerprint)
+	}
+
+	payload, err := buildImageThumbnailPayload(jpegRequest, apptracing.TraceCarrier{})
+	if err != nil {
+		t.Fatalf("buildImageThumbnailPayload: %v", err)
+	}
+	if len(payload.Outputs) != 1 || payload.Outputs[0].Format != "jpg" {
+		t.Fatalf("payload output was not canonicalized: %#v", payload.Outputs)
 	}
 }
 

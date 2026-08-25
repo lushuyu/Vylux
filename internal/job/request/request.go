@@ -116,6 +116,16 @@ type structuredDeliveryRequest struct {
 	CallbackURL string `json:"callback_url"`
 }
 
+type imageCreateRequest struct {
+	Source   sourceField                     `json:"source"`
+	Pipeline *structuredImagePipelineRequest `json:"pipeline,omitempty"`
+	Delivery *structuredDeliveryRequest      `json:"delivery,omitempty"`
+}
+
+type structuredImagePipelineRequest struct {
+	Outputs []structuredImageOutput `json:"outputs,omitempty"`
+}
+
 // Decode reads the structured job request schema and normalizes it.
 func Decode(r io.Reader) (Normalized, error) {
 	var req rawJobRequest
@@ -147,17 +157,22 @@ func DecodeAudioCreate(r io.Reader) (Normalized, error) {
 
 // DecodeImageCreate reads the public image create contract used by POST /api/image/jobs.
 func DecodeImageCreate(r io.Reader) (Normalized, error) {
-	var req rawJobRequest
+	var req imageCreateRequest
 	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		return Normalized{}, err
 	}
-	if req.Type != "" || req.Hash != "" || req.Options != nil || req.CallbackURL != "" || req.MediaKind != "" || req.Operation != "" {
-		return Normalized{}, fmt.Errorf("image create requests must use the /api/image/jobs contract without type/hash/options/callback_url/media_kind/operation fields")
+
+	normalized := rawJobRequest{
+		Source:   req.Source,
+		Delivery: req.Delivery,
+	}
+	if req.Pipeline != nil {
+		normalized.Pipeline = &structuredPipelineRequest{Outputs: req.Pipeline.Outputs}
 	}
 
-	return req.normalizeStructuredImageProcess()
+	return normalized.normalizeStructuredImageProcess()
 }
 
 // DecodeVideoCreate reads the public video create contract used by POST /api/video/jobs.
@@ -206,6 +221,19 @@ func Canonicalize(r *Normalized) error {
 	}
 
 	switch r.Type {
+	case queue.TypeImageThumbnail:
+		parsed, err := parseImageThumbnailOptions(r.Options)
+		if err != nil {
+			return fmt.Errorf("invalid options: %w", err)
+		}
+		if err := canonicalizeImageThumbnailOptions(&parsed); err != nil {
+			return fmt.Errorf("invalid options: %w", err)
+		}
+		canonical, err := structToOptionsMap(parsed)
+		if err != nil {
+			return fmt.Errorf("canonicalize options: %w", err)
+		}
+		r.Options = canonical
 	case queue.TypeAudioTranscode:
 		parsed, err := parseAudioTranscodeOptions(r.Options)
 		if err != nil {
@@ -434,19 +462,24 @@ func buildStructuredImageOptions(pipeline *structuredPipelineRequest) (map[strin
 	}
 	outputs := make([]map[string]any, 0, len(pipeline.Outputs))
 	for _, output := range pipeline.Outputs {
-		if strings.TrimSpace(output.Variant) == "" {
+		variant := strings.TrimSpace(output.Variant)
+		if variant == "" {
 			return nil, fmt.Errorf("pipeline.outputs variant is required")
 		}
 		if output.Width <= 0 {
 			return nil, fmt.Errorf("pipeline.outputs width must be greater than 0")
 		}
-		if strings.TrimSpace(output.Format) == "" {
-			return nil, fmt.Errorf("pipeline.outputs format is required")
+		if output.Height < 0 {
+			return nil, fmt.Errorf("pipeline.outputs height must not be negative")
+		}
+		format, err := canonicalImageFormat(output.Format)
+		if err != nil {
+			return nil, fmt.Errorf("pipeline.outputs format: %w", err)
 		}
 		entry := map[string]any{
-			"variant": output.Variant,
+			"variant": variant,
 			"width":   output.Width,
-			"format":  output.Format,
+			"format":  format,
 		}
 		if output.Height > 0 {
 			entry["height"] = output.Height
@@ -664,8 +697,11 @@ func validateCallbackURL(raw string) error {
 func validateJobOptions(jobType string, opts map[string]any) error {
 	switch jobType {
 	case queue.TypeImageThumbnail:
-		_, err := parseImageThumbnailOptions(opts)
+		parsed, err := parseImageThumbnailOptions(opts)
 		if err != nil {
+			return fmt.Errorf("invalid options: %w", err)
+		}
+		if err := canonicalizeImageThumbnailOptions(&parsed); err != nil {
 			return fmt.Errorf("invalid options: %w", err)
 		}
 	case queue.TypeAudioTranscode:
@@ -711,6 +747,49 @@ type imageThumbnailOptions struct {
 
 func parseImageThumbnailOptions(opts map[string]any) (imageThumbnailOptions, error) {
 	return jsonx.StrictCodec.DecodeStrict[imageThumbnailOptions](opts)
+}
+
+func canonicalizeImageThumbnailOptions(opts *imageThumbnailOptions) error {
+	if opts == nil {
+		return nil
+	}
+
+	for i := range opts.Outputs {
+		output := &opts.Outputs[i]
+		output.Variant = strings.TrimSpace(output.Variant)
+		if output.Variant == "" {
+			return fmt.Errorf("output variant is required")
+		}
+		if output.Width <= 0 {
+			return fmt.Errorf("output width must be greater than 0")
+		}
+		if output.Height < 0 {
+			return fmt.Errorf("output height must not be negative")
+		}
+		format, err := canonicalImageFormat(output.Format)
+		if err != nil {
+			return err
+		}
+		output.Format = format
+	}
+
+	return nil
+}
+
+func canonicalImageFormat(raw string) (string, error) {
+	format := strings.ToLower(strings.TrimSpace(raw))
+	format = strings.TrimPrefix(format, ".")
+
+	switch format {
+	case "webp", "avif", "png", "gif":
+		return format, nil
+	case "jpg", "jpeg":
+		return "jpg", nil
+	case "":
+		return "", fmt.Errorf("format is required")
+	default:
+		return "", fmt.Errorf("unsupported format %q", raw)
+	}
 }
 
 func parseVideoCoverOptions(opts map[string]any) (queue.VideoCoverOptions, error) {

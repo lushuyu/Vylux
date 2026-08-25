@@ -117,7 +117,7 @@ func TestDecodeImageCreate(t *testing.T) {
 
 func TestDecodeImageCreateRejectsStructuredJobDiscriminatorFields(t *testing.T) {
 	body := `{
-		"media_kind":"image",
+		"asset_type":"image",
 		"operation":"process",
 		"source":{"hash":"hash123","key":"uploads/image.png"}
 	}`
@@ -126,7 +126,71 @@ func TestDecodeImageCreateRejectsStructuredJobDiscriminatorFields(t *testing.T) 
 	if err == nil {
 		t.Fatal("expected discriminator fields to be rejected")
 	}
-	if !strings.Contains(err.Error(), "/api/image/jobs contract") {
+	if !strings.Contains(err.Error(), `unknown field "asset_type"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDecodeImageCreateRejectsForbiddenFieldsRegardlessOfValue(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty asset type", body: `{"asset_type":"","source":{"hash":"hash123","key":"uploads/image.png"}}`},
+		{name: "empty operation", body: `{"operation":"","source":{"hash":"hash123","key":"uploads/image.png"}}`},
+		{name: "empty legacy type", body: `{"type":"","source":{"hash":"hash123","key":"uploads/image.png"}}`},
+		{name: "empty legacy hash", body: `{"hash":"","source":{"hash":"hash123","key":"uploads/image.png"}}`},
+		{name: "null legacy options", body: `{"options":null,"source":{"hash":"hash123","key":"uploads/image.png"}}`},
+		{name: "empty legacy callback", body: `{"callback_url":"","source":{"hash":"hash123","key":"uploads/image.png"}}`},
+		{name: "disabled analyze", body: `{"source":{"hash":"hash123","key":"uploads/image.png"},"pipeline":{"analyze":false}}`},
+		{name: "empty downloads", body: `{"source":{"hash":"hash123","key":"uploads/image.png"},"pipeline":{"downloads":[]}}`},
+		{name: "disabled waveform", body: `{"source":{"hash":"hash123","key":"uploads/image.png"},"pipeline":{"waveform":{"enabled":false}}}`},
+		{name: "disabled normalize", body: `{"source":{"hash":"hash123","key":"uploads/image.png"},"pipeline":{"normalize":{"enabled":false}}}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodeImageCreate(strings.NewReader(tt.body))
+			if err == nil {
+				t.Fatal("expected forbidden field to be rejected")
+			}
+			if !strings.Contains(err.Error(), "unknown field") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestDecodeImageCreateCanonicalizesOutputFormat(t *testing.T) {
+	body := `{
+		"source":{"hash":"hash123","key":"uploads/image.png"},
+		"pipeline":{"outputs":[{"variant":" thumbnail ","width":320,"format":" .JPEG "}]}
+	}`
+
+	req, err := DecodeImageCreate(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("DecodeImageCreate: %v", err)
+	}
+	outputs, ok := req.Options["outputs"].([]map[string]any)
+	if !ok || len(outputs) != 1 {
+		t.Fatalf("unexpected options: %#v", req.Options)
+	}
+	if outputs[0]["variant"] != "thumbnail" || outputs[0]["format"] != "jpg" {
+		t.Fatalf("output was not canonicalized: %#v", outputs[0])
+	}
+}
+
+func TestDecodeImageCreateRejectsUnsupportedOutputFormat(t *testing.T) {
+	body := `{
+		"source":{"hash":"hash123","key":"uploads/image.png"},
+		"pipeline":{"outputs":[{"variant":"thumbnail","width":320,"format":"not-a-format"}]}
+	}`
+
+	_, err := DecodeImageCreate(strings.NewReader(body))
+	if err == nil {
+		t.Fatal("expected unsupported format to be rejected")
+	}
+	if !strings.Contains(err.Error(), "unsupported format") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -202,6 +266,93 @@ func TestCanonicalizeAudioTranscodeDefaultsOutputs(t *testing.T) {
 	}
 	if req.Options["waveform_bins"] != float64(2048) {
 		t.Fatalf("expected default waveform bins 2048, got %#v", req.Options["waveform_bins"])
+	}
+}
+
+func TestCanonicalizeImageThumbnailPreservesOutputs(t *testing.T) {
+	req := Normalized{
+		Type:   queue.TypeImageThumbnail,
+		Hash:   "hash123",
+		Source: "uploads/image.png",
+		Options: map[string]any{
+			"outputs": []map[string]any{{
+				"variant": "thumbnail",
+				"width":   320,
+				"height":  180,
+				"format":  "webp",
+			}},
+		},
+	}
+
+	if err := Canonicalize(&req); err != nil {
+		t.Fatalf("Canonicalize: %v", err)
+	}
+	parsed, err := parseImageThumbnailOptions(req.Options)
+	if err != nil {
+		t.Fatalf("parseImageThumbnailOptions: %v", err)
+	}
+	if len(parsed.Outputs) != 1 {
+		t.Fatalf("outputs length = %d, want 1", len(parsed.Outputs))
+	}
+	want := queue.ThumbnailOutput{Variant: "thumbnail", Width: 320, Height: 180, Format: "webp"}
+	if parsed.Outputs[0] != want {
+		t.Fatalf("output = %#v, want %#v", parsed.Outputs[0], want)
+	}
+	if _, ok := req.Options["outputs"].([]any); !ok {
+		t.Fatalf("canonical outputs type = %T, want []any", req.Options["outputs"])
+	}
+}
+
+func TestCanonicalizeImageThumbnailNormalizesEquivalentFormats(t *testing.T) {
+	for _, format := range []string{"jpg", "jpeg", "JPG", ".JPEG"} {
+		t.Run(format, func(t *testing.T) {
+			req := Normalized{
+				Type:   queue.TypeImageThumbnail,
+				Hash:   "hash123",
+				Source: "uploads/image.png",
+				Options: map[string]any{
+					"outputs": []map[string]any{{
+						"variant": "thumbnail",
+						"width":   320,
+						"format":  format,
+					}},
+				},
+			}
+
+			if err := Canonicalize(&req); err != nil {
+				t.Fatalf("Canonicalize: %v", err)
+			}
+			parsed, err := parseImageThumbnailOptions(req.Options)
+			if err != nil {
+				t.Fatalf("parseImageThumbnailOptions: %v", err)
+			}
+			if parsed.Outputs[0].Format != "jpg" {
+				t.Fatalf("format = %q, want jpg", parsed.Outputs[0].Format)
+			}
+		})
+	}
+}
+
+func TestCanonicalizeImageThumbnailRejectsUnsupportedFormat(t *testing.T) {
+	req := Normalized{
+		Type:   queue.TypeImageThumbnail,
+		Hash:   "hash123",
+		Source: "uploads/image.png",
+		Options: map[string]any{
+			"outputs": []map[string]any{{
+				"variant": "thumbnail",
+				"width":   320,
+				"format":  "not-a-format",
+			}},
+		},
+	}
+
+	err := Canonicalize(&req)
+	if err == nil {
+		t.Fatal("expected unsupported format to be rejected")
+	}
+	if !strings.Contains(err.Error(), "unsupported format") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
